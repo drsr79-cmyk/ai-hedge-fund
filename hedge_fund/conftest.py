@@ -1,11 +1,8 @@
-"""Load .env for v2 tests so FINANCIAL_DATASETS_API_KEY is available."""
+"""Shared test fixtures. Credentials are not loaded from dotenv files."""
 
 import pytest
-from dotenv import load_dotenv
 
 from hedge_fund.features import breakpoints
-
-load_dotenv()
 
 
 @pytest.fixture(autouse=True)

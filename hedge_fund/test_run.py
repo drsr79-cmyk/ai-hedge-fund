@@ -1,6 +1,7 @@
 """The CLI: configuration preflight, the backtest command, and the paper flow."""
 
 import json
+import re
 import sys
 from datetime import datetime
 from unittest.mock import Mock
@@ -30,10 +31,14 @@ def offline(tmp_path, monkeypatch):
         def __exit__(self, *args):
             return False
 
+        def close(self):
+            return None
+
     def build_fund(spec, blind=False):
         return Fund(spec, models={s.name: [FakeAnalyst(m.name, {"AAPL": .8, "MSFT": -.6}) for m in s.models]
                                   for s in spec.strategies})
 
+    monkeypatch.setenv("AIHF_PROFILE", "network")
     monkeypatch.setattr(run, "apply_credentials", lambda: None)
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: tmp_path)
     monkeypatch.setattr(run, "Fund", build_fund)
@@ -66,6 +71,16 @@ def _mandate(tmp_path, mode="long_short", name="mixed"):
 def _main(monkeypatch, *argv):
     monkeypatch.setattr(sys, "argv", ["aihf", *argv])
     run.main()
+
+
+def _tick(monkeypatch, capsys, name, *extra):
+    """A paper tick must refuse until the printed token is passed back."""
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", "tick", name, *extra)
+    assert exc.value.code == 2
+    token = re.search(r"approval-token: ([0-9a-f]{32})", capsys.readouterr().err)
+    assert token is not None
+    _main(monkeypatch, "paper", "tick", name, *extra, "--approve", token.group(1))
 
 
 @pytest.mark.parametrize("command", ["backtest", "create"])
@@ -154,7 +169,7 @@ def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys
     listed = capsys.readouterr().out
     assert "alpha" in listed and "not started" in listed
 
-    _main(monkeypatch, "paper", "tick", "alpha")
+    _tick(monkeypatch, capsys, "alpha")
     output = capsys.readouterr()
     record = json.loads(output.out)
     assert record["session"] == "2025-01-06" and record["decision"] is not None and record["executed"] is None
@@ -166,7 +181,7 @@ def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys
     assert "no completed SPY session after 2025-01-06" in capsys.readouterr().err
 
     set_today("2025-01-08")
-    _main(monkeypatch, "paper", "tick", "alpha")
+    _tick(monkeypatch, capsys, "alpha")
     output = capsys.readouterr()
     record = json.loads(output.out)
     assert record["session"] == "2025-01-07" and record["executed"]["positions"]["AAPL"] > 0
@@ -186,7 +201,7 @@ def test_paper_flow_create_tick_status_halt_resume(tmp_path, monkeypatch, capsys
     assert exc.value.code == 1 and "halted" in capsys.readouterr().err
 
     _main(monkeypatch, "paper", "resume", "alpha")
-    _main(monkeypatch, "paper", "tick", "alpha")
+    _tick(monkeypatch, capsys, "alpha")
     assert json.loads(capsys.readouterr().out)["session"] == "2025-01-08"
     _main(monkeypatch, "paper", "list")
     assert "3 sessions" in capsys.readouterr().out
@@ -214,13 +229,16 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     _main(monkeypatch, "paper", "create", "fast", "--mandate", str(path), "--universe", "AAPL")
     err = " ".join(capsys.readouterr().err.split())  # the console wraps; read it as one line
     assert "every 30s" in err and "09:30–12:00 ET" in err
-    assert "aihf paper tick fast` to run one session" in err and "aihf paper run fast` to leave it running" in err
+    assert "aihf paper tick fast" in err and "Unattended `paper run` is disabled" in err
 
     class CliTape(Tape):
         def __enter__(self):
             return self
         def __exit__(self, *args):
             return False
+
+        def close(self):
+            return None
     tape = CliTape({"AAPL": {"2025-01-07T09:30:00": 100.0, "2025-01-07T09:30:30": 101.0},
                     "SPY": {"2025-01-07T09:30:00": 500.0}},
                    now=datetime(2025, 1, 7, 9, 30, 40, tzinfo=NEW_YORK))  # 10s into the 09:30:30 bar
@@ -232,7 +250,7 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
             return tape.now.astimezone(tz)
     monkeypatch.setattr(tick_module, "datetime", Clock)
 
-    _main(monkeypatch, "paper", "tick", "fast")
+    _tick(monkeypatch, capsys, "fast")
     output = capsys.readouterr()
     record = json.loads(output.out)
     assert record["session"] == "2025-01-07T09:30:30" and record["decision"] is not None
@@ -249,18 +267,13 @@ def test_paper_minute_fund_ticks_and_runs_like_a_daily_one(tmp_path, monkeypatch
     listed = capsys.readouterr().out
     assert "every 30s" in listed and "running" not in listed
 
-    # `run` is the serve loop; stand in for it and check the wiring around it.
-    seen = {}
-    def fake_serve(directory, data, *, on_record, on_event):
-        seen["pid"] = directory / PID_FILE
-        on_event("gap", {"from": None, "to": "2025-01-07T09:30:00", "bars_skipped": 3})
-    monkeypatch.setattr(run, "serve", fake_serve)
-    _main(monkeypatch, "paper", "run", "fast")
-    err = capsys.readouterr().err
-    assert "fast" in err and "every 30s" in err and "gap start → 2025-01-07T09:30:00  3 bars skipped" in err
-    assert "stopped" in err
+    # Unattended run must refuse before any runner starts. serve is not on the CLI module.
+    with pytest.raises(SystemExit) as exc:
+        _main(monkeypatch, "paper", "run", "fast")
+    assert exc.value.code == 2
+    assert "unattended paper run is disabled" in capsys.readouterr().err
 
-    (seen["pid"]).write_text(str(os.getpid()))
+    (directory_pid := tmp_path / "paper" / "fast" / PID_FILE).write_text(str(os.getpid()))
     _main(monkeypatch, "paper", "list")
     assert "running" in capsys.readouterr().out
     monkeypatch.setattr(run, "stop_runner", lambda directory: True)

@@ -28,9 +28,18 @@ class PaymentFailed(requests.RequestException):
 def payment_session(private_key: str) -> requests.Session:
     """A requests Session that pays each 402 from the wallet *private_key*.
 
-    Raises ImportError with the install command when the x402 extra is
+    Refused unless the network profile and ``AIHF_ENABLE_X402=1`` are both
+    set. Raises ImportError with the install command when the x402 extra is
     missing; the client turns that into its own error.
     """
+    from hedge_fund.safety.profile import x402_payments_allowed
+
+    if not x402_payments_allowed():
+        raise RuntimeError(
+            "x402 payments are disabled. They stay off in the safe profile. "
+            "On the network profile they also require AIHF_ENABLE_X402=1. "
+            "A wallet private key alone is not permission to pay."
+        )
     try:
         from eth_account import Account
         from x402 import x402ClientSync

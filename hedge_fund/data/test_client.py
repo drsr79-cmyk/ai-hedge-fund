@@ -8,9 +8,8 @@ TICKERS = ["AAPL", "MSFT", "NVDA", "JPM", "XOM"]
 PRICE_START = "2024-01-01"
 PRICE_END = "2026-04-15"
 
-pytestmark = pytest.mark.skipif(
-    not has_data_credential(),
-    reason="live Financial Datasets smoke tests require FINANCIAL_DATASETS_API_KEY or X402_WALLET_PRIVATE_KEY",
+pytestmark = pytest.mark.skip(
+    reason="live Financial Datasets calls are disabled in this fork's tests; no real keys or network",
 )
 
 

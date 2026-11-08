@@ -12,6 +12,7 @@ from hedge_fund.backtesting.test_fund import FakeDataClient, SERIES
 from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper import deploy, is_running, Ledger, NothingDue, PID_FILE, redo, run, serve, stop_runner, tick
+from hedge_fund.safety.approval import approval_token, pending_fingerprint
 from hedge_fund.paper.test_tick import build_fund
 from hedge_fund.pipeline.session import FundHalted
 from hedge_fund.pipeline.test_clock import Tape
@@ -35,6 +36,24 @@ def _spec(**overrides):
         "costs": {"spread_bps": 0, "commission_per_share": 0}, "rebalance": "minute", "interval": 5, "window": {"start": "13:00", "end": "13:10"},
         **overrides,
     })
+
+
+def _redo_token(directory):
+    from hedge_fund.paper.deployed import load_deployed
+    deployed = load_deployed(directory)
+    ledger = Ledger(directory)
+    state = ledger.replay(deployed.spec.capital)
+    before = ledger.replay(deployed.spec.capital, before=state.last_session)
+    return approval_token(deployed.name, state.last_session, pending_fingerprint(before.pending))
+
+
+def _approved_tick(directory, tape, build_fund):
+    deployed = __import__("hedge_fund.paper.deployed", fromlist=["load_deployed"]).load_deployed(directory)
+    state = Ledger(directory).replay(deployed.spec.capital)
+    from hedge_fund.paper.tick import next_session
+    due = next_session(tape, deployed.spec, state.last_session, now=lambda: tape.now)
+    token = approval_token(deployed.name, due, pending_fingerprint(state.pending)) if due else None
+    return tick(directory, tape, build_fund=build_fund, now=lambda: tape.now, approval=token)
 
 
 def _at(day, hhmmss):
@@ -62,7 +81,8 @@ class Loop:
 
     def __call__(self):
         run(self.directory, self.tape, stop=self.stop, build_fund=build_fund, now=lambda: self.tape.now,
-            sleep=self._sleep, on_record=self._record, on_event=lambda k, f: self.events.append((k, f)))
+            sleep=self._sleep, on_record=self._record, on_event=lambda k, f: self.events.append((k, f)),
+            approver=lambda name, session, pending: approval_token(name, session, pending_fingerprint(pending)))
 
     def _sleep(self, seconds):
         self.tape.now += timedelta(seconds=seconds)
@@ -155,7 +175,7 @@ def test_redo_runs_a_bar_again_at_the_prices_it_saw(tmp_path):
     loop = Loop(directory, tape, records=3)
     loop()
     tape.snapshot_calls.clear()
-    again = redo(directory, tape, build_fund=build_fund)
+    again = redo(directory, tape, build_fund=build_fund, approval=_redo_token(directory))
     assert tape.snapshot_calls == []  # no new prints were taken
     assert again.session == loop.records[2].session and again.marks == loop.records[2].marks
     assert again.hash == loop.records[2].hash  # same prints, same analysts: the same record
@@ -167,7 +187,7 @@ def test_redo_runs_a_bar_again_at_the_prices_it_saw(tmp_path):
 
     def bearish(spec):
         return Fund(spec, models={"solo": [FakeAnalyst("a", {"AAPL": -1})]})
-    flipped = redo(directory, tape, build_fund=bearish)
+    flipped = redo(directory, tape, build_fund=bearish, approval=_redo_token(directory))
     assert flipped.decision.final_weights == {"AAPL": -1.0} and flipped.hash != again.hash
 
 
@@ -179,21 +199,21 @@ def test_tick_runs_the_current_bar_by_hand_at_the_print_taken_now(tmp_path):
     directory = deploy("bars", _spec(), ["AAPL"], root=tmp_path)
     tape = _tape(_at(DAY, "12:00:00"))
     with pytest.raises(NothingDue, match="no bar yet; next 13:00:00 ET"):
-        tick(directory, tape, build_fund=build_fund, now=lambda: tape.now)
+        _approved_tick(directory, tape, build_fund)
 
     tape.now = _at(DAY, "13:00:00")
-    first = tick(directory, tape, build_fund=build_fund, now=lambda: tape.now)
+    first = _approved_tick(directory, tape, build_fund)
     assert first.session == f"{DAY}T13:00:00" and first.decision is not None
     with pytest.raises(NothingDue, match=f"no bar after {DAY}T13:00:00; next 13:05:00 ET"):
-        tick(directory, tape, build_fund=build_fund, now=lambda: tape.now)
+        _approved_tick(directory, tape, build_fund)
 
     tape.now = _at(DAY, "13:07:30")  # two and a half minutes into the 13:05 bar
-    second = tick(directory, tape, build_fund=build_fund, now=lambda: tape.now)
+    second = _approved_tick(directory, tape, build_fund)
     assert second.session == f"{DAY}T13:05:00" and second.executed.fills[0].price == 101.0
     assert second.snapshot_times["AAPL"] == "2024-06-04T17:05:00Z"  # the latest print on the tape, as taken
 
     tape.now = _at(DAY, "13:10:00")
-    third = tick(directory, tape, build_fund=build_fund, now=lambda: tape.now)
+    third = _approved_tick(directory, tape, build_fund)
     ledger = Ledger(directory)
     assert third.session == f"{DAY}T13:10:00" and ledger.checkpoint_path(DAY).exists()
     assert [e["kind"] for e in ledger.events()] == ["tick", "tick", "tick", "checkpoint"]
@@ -201,7 +221,7 @@ def test_tick_runs_the_current_bar_by_hand_at_the_print_taken_now(tmp_path):
     del tape.path["SPY"][f"{NEXT}T13:00:00"]  # the market has not opened tomorrow by the first bar
     tape.now = _at(NEXT, "13:00:00")
     with pytest.raises(NothingDue, match="SPY has not printed today"):
-        tick(directory, tape, build_fund=build_fund, now=lambda: tape.now)
+        _approved_tick(directory, tape, build_fund)
     assert ledger.sessions()[-1] == third.session
 
 
@@ -254,7 +274,7 @@ def test_serve_holds_a_pid_file_and_stops_on_sigterm(tmp_path, monkeypatch):
         seen["stopped"] = stop.wait(5)
     monkeypatch.setattr(runner, "run", quick)
 
-    serve(directory, _tape(_at(DAY, "12:59:00")))
+    serve(directory, _tape(_at(DAY, "12:59:00")), approver=lambda *args: "test")
     assert seen == {"pid": os.getpid(), "running": True, "stopped": True}
     assert not (directory / PID_FILE).exists() and not is_running(directory)
     # Two runners on one fund is a race on the ledger: the second refuses.

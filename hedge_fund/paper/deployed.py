@@ -58,6 +58,12 @@ def deploy(
     mandate's capital. Returns the fund's directory. Refuses to overwrite."""
     validate_fund_name(name)
     universe = normalize_universe(universe)
+    if spec.risk.max_gross_exposure > 1:
+        raise ValueError(
+            f"{name}: max_gross_exposure {spec.risk.max_gross_exposure} is above 1. "
+            "Paper mode refuses leverage. This ceiling is an engineering control, "
+            "not an investment policy."
+        )
     directory = Path(root) / name
     if directory.exists():
         raise FileExistsError(f"paper fund {name!r} already exists at {directory}")

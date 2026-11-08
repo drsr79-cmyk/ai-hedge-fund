@@ -22,14 +22,14 @@ def analyst_table(card: Scorecard) -> Table:
     """Hit rate and slugging on benchmark-relative returns; IC as a per-date
     series. Each view is judged at the horizon its analyst declared."""
     table = _table("ANALYSTS  ·  each view judged at its own horizon")
-    table.add_column("analyst", style=f"bold {TEXT}")
+    table.add_column("analyst", style=f"bold {TEXT}", min_width=14)
     table.add_column("horizon", justify="right")
     table.add_column("views", justify="right")
     table.add_column("pending", justify="right")
     table.add_column("abstained", justify="right")
-    table.add_column("hit rate", justify="right")
-    table.add_column("slugging", justify="right")
-    table.add_column("IC", justify="right")
+    table.add_column("hit rate", justify="right", min_width=12)
+    table.add_column("slugging", justify="right", min_width=8)
+    table.add_column("IC", justify="right", min_width=8)
     table.add_column("IC t", justify="right")
     table.add_column("dates", justify="right")
     if not card.analysts:
@@ -56,7 +56,7 @@ def analyst_table(card: Scorecard) -> Table:
 def strategy_table(card: Scorecard) -> Table:
     """Each sleeve's P&L between executions, and the part no sleeve explains."""
     table = _table("STRATEGIES  ·  P&L between executions")
-    table.add_column("strategy", style=f"bold {TEXT}")
+    table.add_column("strategy", style=f"bold {TEXT}", min_width=16)
     table.add_column("periods", justify="right")
     table.add_column("P&L", justify="right")
     table.add_column("return", justify="right")
@@ -93,7 +93,7 @@ def strategy_table(card: Scorecard) -> Table:
 
 def _table(title: str) -> Table:
     return Table(box=box.SQUARE, header_style="bold", border_style="#1f2b25",
-                 title=Text(title, style=f"bold {BRIGHT}"), title_justify="left")
+                 title=Text(title, style=f"bold {BRIGHT}"), title_justify="left", expand=True)
 
 
 def _rate(value: float | None, n: int) -> Text:

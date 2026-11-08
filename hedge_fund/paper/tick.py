@@ -31,7 +31,9 @@ from hedge_fund.data.protocol import DataClient
 from hedge_fund.data.sessions import completed_through, NEW_YORK, previous_day, session_closes
 from hedge_fund.fund import Fund, FundSpec, TradingWindow
 from hedge_fund.paper.deployed import BROKER_FILE, load_deployed
-from hedge_fund.paper.ledger import Ledger
+from hedge_fund.paper.ledger import Ledger, LedgerError
+from hedge_fund.safety.approval import ApprovalRequired, approval_token, pending_fingerprint
+from hedge_fund.safety.broker import HaltGate
 from hedge_fund.pipeline.clock import Clock, LiveClock, Marked
 from hedge_fund.pipeline.session import advance, FundHalted, FundState, is_rebalance_session, next_state, SessionRecord
 from hedge_fund.scorecard import current_allocation
@@ -156,6 +158,7 @@ def tick(
     session: str | None = None,
     build_fund: Callable[[FundSpec], Fund] | None = None,
     now: Callable[[], datetime] | None = None,
+    approval: str | None = None,
 ) -> SessionRecord:
     """Advance the paper fund in *directory* by one session and record it.
 
@@ -166,6 +169,7 @@ def tick(
     benchmark has not printed today), FundHalted when the kill switch is
     set. *now* is the clock; tests inject it.
     """
+    _refuse_inherited_secrets()
     directory = Path(directory)
     deployed = load_deployed(directory)
     spec = deployed.spec
@@ -198,6 +202,7 @@ def tick(
                 f"{deployed.name}: {spec.benchmark} has not printed today (market closed); "
                 f"next {following_session(spec, state.last_session, now())}"
             )
+    _require_approval(deployed.name, due, state.pending, approval)
     return _run(directory, deployed, ledger, state, due, data_client, build_fund, clock=clock)
 
 
@@ -211,6 +216,7 @@ def redo(
     data_client: DataClient,
     *,
     build_fund: Callable[[FundSpec], Fund] | None = None,
+    approval: str | None = None,
 ) -> SessionRecord:
     """Run the latest recorded session again and replace its record.
 
@@ -222,6 +228,7 @@ def redo(
     the first time. Raises NothingDue when nothing has been recorded yet,
     FundHalted when the kill switch is set.
     """
+    _refuse_inherited_secrets()
     directory = Path(directory)
     deployed = load_deployed(directory)
     ledger = Ledger(directory)
@@ -232,6 +239,7 @@ def redo(
         raise NothingDue(f"{deployed.name}: no session recorded yet, nothing to run again")
 
     before = ledger.replay(deployed.spec.capital, before=state.last_session)
+    _require_approval(deployed.name, state.last_session, before.pending, approval)
     superseded = ledger.rewind()
     PaperBroker.restore(directory / BROKER_FILE, before.cash, before.positions, deployed.spec.costs)
     ledger.log_event("redo", session=superseded.session, superseded=superseded.hash)
@@ -259,19 +267,33 @@ def _run(
     minute fund's closing bar also checkpoints the day, so tomorrow's
     replay starts from tonight."""
     broker = PaperBroker(directory / BROKER_FILE, deployed.spec.costs)
+    cash_before, shares_before = broker.cash(), {t: p.shares for t, p in broker.positions().items()}
+    long_only = all(strategy.blend.mode == "long_only" for strategy in deployed.spec.strategies)
+    gated = HaltGate(broker, ledger, long_only=long_only)
     fund = fund or (build_fund or Fund)(deployed.spec)
     try:
         allocation = (current_allocation(deployed.spec, state, session, ledger.records)
                       if is_rebalance_session(session, state.last_session, deployed.spec.rebalance) else None)
-        record = advance(fund, state, session, broker, data_client, deployed.universe, clock, allocation)
+        record = advance(fund, state, session, gated, data_client, deployed.universe, clock, allocation)
+        held = {t: p.shares for t, p in broker.positions().items()}
+        if held != {t: shares for t, shares in record.positions.items() if shares}:
+            raise LedgerError(f"{deployed.name}: broker positions do not match the session record")
+        if abs(broker.cash() - record.cash) > 0.01:
+            raise LedgerError(f"{deployed.name}: broker cash does not match the session record")
         ledger.append(record)
-    except FundHalted:
-        raise
     except Exception as exc:
+        PaperBroker.restore(directory / BROKER_FILE, cash_before, shares_before, deployed.spec.costs)
+        if isinstance(exc, FundHalted):
+            raise
         reason = f"tick {session} failed: {type(exc).__name__}: {exc}"
         ledger.log_event("tick_failed", session=session, error=f"{type(exc).__name__}: {exc}")
         ledger.halt(reason)
         raise
+    if (
+        record.executed is not None
+        and any(clamp.limit == "max_drawdown_pct" for clamp in record.executed.clamps)
+    ):
+        ledger.halt("drawdown stop: engineering ceiling breached; pending orders were not sent")
     ledger.log_event(
         "tick", session=session, nav=record.nav,
         executed=record.executed is not None, decided=record.decision is not None,
@@ -279,3 +301,17 @@ def _run(
     if is_intraday(session) and is_last_bar(session, deployed.spec.window):
         ledger.checkpoint(next_state(state, record))
     return record
+
+
+def _refuse_inherited_secrets() -> None:
+    from hedge_fund.safety.profile import SAFE, current_profile
+    from hedge_fund.safety.secrets import require_secretless_process
+
+    if current_profile() == SAFE:
+        require_secretless_process()
+
+
+def _require_approval(name: str, session: str, pending, approval: str | None) -> None:
+    token = approval_token(name, session, pending_fingerprint(pending))
+    if approval != token:
+        raise ApprovalRequired(name, session, token)

@@ -165,8 +165,18 @@ def execute_decision(
     equity_before = cash_before + sum(p.shares * marks[t] for t, p in held.items())
     if not isfinite(equity_before) or equity_before <= 0:
         raise ValueError(f"{spec.name}: equity on {session} must be finite and positive")
-    liquid = liquidity(sorted(set(held) | set(targets)), clock.session_date(session), data_client,
-                       history_days(spec))
+    traded = sorted(set(held) | set(targets))
+    liquid = liquidity(traded, clock.session_date(session), data_client, history_days(spec))
+    unknown = [
+        ticker for ticker in traded
+        if ticker not in liquid or not isfinite(liquid[ticker].adv) or liquid[ticker].adv <= 0
+    ]
+    if unknown:
+        raise ValueError(
+            "unknown liquidity for "
+            + ", ".join(unknown)
+            + "; refusing to trade without a finite positive ADV"
+        )
     max_shares: dict[str, int] | None = None
     if spec.risk.max_adv_pct is not None:
         max_shares = {t: int(spec.risk.max_adv_pct * name.adv) for t, name in liquid.items()}
@@ -234,8 +244,8 @@ def liquidity(
 ) -> dict[str, Liquidity]:
     """Each name's liquidity from its last 20 daily bars on or before *as_of*
     (fewer when fewer printed): mean volume, and the sample sigma of the
-    daily log returns. A name with no bars is absent: a missing number must
-    not silently freeze a name, so it trades uncapped and pays no impact.
+    daily log returns.     A name with no bars is absent. Callers must treat that as unknown
+    liquidity and refuse the order; a missing ADV is not permission to trade.
     Fewer than three bars give no sigma, and the name pays no impact either.
     *days* is the mandate's history window, so the fetch is the one the
     marks made.

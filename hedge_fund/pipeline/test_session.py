@@ -249,14 +249,11 @@ def test_a_breach_on_a_valuation_day_stops_the_fund_out_and_keeps_it_in_cash():
     records, state = _step(fund, WEEKDAYS[:6], data=FakeDataClient(series))
     monday, tuesday, wednesday, thursday, friday, next_monday = records
 
-    assert not wednesday.rebalance and wednesday.decision is not None
-    assert wednesday.decision.is_stopped_out
-    assert wednesday.decision.final_weights == {"AAPL": 0.0}
-    assert [(c.limit, c.ticker, c.before, c.after) for c in wednesday.decision.clamps] == [
-        ("max_drawdown_pct", None, pytest.approx(0.25), 0.0)]
-    assert all(sr.signals == [] for sr in wednesday.decision.strategies)
-
-    assert thursday.executed is not None and thursday.executed.positions == {}
+    assert not wednesday.rebalance and wednesday.decision is None
+    assert wednesday.executed is not None and wednesday.executed.refreshed_assessment.is_stopped_out
+    assert wednesday.positions == {}
+    assert wednesday.cash == pytest.approx(75_000) and wednesday.nav == pytest.approx(75_000)
+    assert thursday.executed is None and thursday.positions == {}
     assert thursday.cash == pytest.approx(75_000) and thursday.nav == pytest.approx(75_000)
     # Friday is flat and Monday is a rebalance session: no decision, no analyst asked.
     calls_after_stop = analyst.predict.call_count
@@ -278,10 +275,10 @@ def test_a_friday_stop_out_is_not_refreshed_away_on_monday():
     fund, analyst = _stop_fund()
     records, _ = _step(fund, WEEKDAYS[:6], data=FakeDataClient(_aapl({4: 150.0, 5: 150.0})))
     friday, next_monday = records[4], records[5]
-    assert friday.decision.is_stopped_out
+    assert friday.decision is None and friday.executed.refreshed_assessment.is_stopped_out
     calls = analyst.predict.call_count
-    assert next_monday.executed.refreshed_assessment.is_stopped_out
-    assert next_monday.positions == {} and next_monday.cash == pytest.approx(75_000)
+    assert next_monday.executed is None
+    assert next_monday.positions == {} and friday.cash == pytest.approx(75_000)
     assert analyst.predict.call_count == calls
 
 

@@ -301,21 +301,12 @@ def test_paper_screen_enter_on_a_minute_fund_opens_the_same_approval_step(monkey
 def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch, cadence):
     spec = make_minute_spec() if cadence == "minute" else make_spec(["pead"], "alpha")
     directory = deploy(spec.name, spec, ["TEST"], root=paths.PAPER_DIR)
-    for variable in ("FINANCIAL_DATASETS_API_KEY", "TYPESAFE_API_KEY"):
-        monkeypatch.setenv(variable, "x")
-    monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "jev-1.13.0")
-    spawned, stopped = [], []
-
-    def spawn(path):
-        spawned.append(path)
-        (path / PID_FILE).write_text(str(os.getpid()))  # what the real runner does on start
-        return os.getpid()
+    stopped = []
 
     def stop(path):
         stopped.append(path)
         (path / PID_FILE).unlink()
         return True
-    monkeypatch.setattr(paper, "spawn_runner", spawn)
     monkeypatch.setattr(paper, "stop_runner", stop)
 
     async def scenario():
@@ -325,24 +316,16 @@ def test_paper_screen_space_starts_and_stops_a_runner_at_any_cadence(monkeypatch
             screen = app.screen
             menu = screen.query_one("#paper-menu", OptionList)
             assert "● new" in render(menu.get_option("paper:0").prompt)
+            await pilot.press("space")  # must not start an unattended runner
+            await pilot.pause()
+            assert stopped == [] and not (directory / PID_FILE).exists()
+            assert "● running" not in render(menu.get_option("paper:0").prompt)
+            # An already-started pid can still be stopped.
+            (directory / PID_FILE).write_text(str(os.getpid()))
+            screen._populate(spec.name)
             await pilot.press("space")
             await pilot.pause()
-            assert spawned == [directory] and app.screen is screen  # no approval modal for a runner
-            assert "● running" in render(menu.get_option("paper:0").prompt)
-            detail = render(screen.query_one("#detail-body", Static).content)
-            assert "● running · space to stop" in detail
-            await pilot.press("enter")  # the runner owns the ledger while it is up: enter does not run
-            await pilot.pause()
-            assert app.screen is screen
-            await pilot.press("space")
-            await pilot.pause()
-            assert stopped == [directory] and "● new" in render(menu.get_option("paper:0").prompt)
-            # A halted fund's runner is not started.
-            await pilot.press("h")
-            await pilot.pause()
-            await pilot.press("space")
-            await pilot.pause()
-            assert spawned == [directory]
+            assert stopped == [directory]
     asyncio.run(scenario())
 
 
