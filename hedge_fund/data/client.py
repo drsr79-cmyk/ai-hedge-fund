@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from urllib.parse import urlsplit
 
 import requests
 
@@ -21,11 +22,17 @@ from hedge_fund.data.models import (
     PriceSnapshot,
 )
 from hedge_fund.data.wallet import payment_session, WALLET_KEY_ENV
+from hedge_fund.safety.profile import x402_payments_allowed
 
 logger = logging.getLogger(__name__)
 
 NEWS_PAGE = 10  # the most /news/ returns per request
 API_KEY_ENV = "FINANCIAL_DATASETS_API_KEY"
+ALLOWED_DATA_HOST = "api.financialdatasets.ai"
+# Engineering budgets, not a market-data plan. One run cannot walk an
+# unbounded page chain or open unbounded connections.
+MAX_PAGES = 20
+MAX_REQUESTS = 200
 # x402 answers only this far back; older dates get a 403 with the window start.
 X402_HISTORY_DAYS = 365
 
@@ -44,10 +51,14 @@ def payment_error(resp: requests.Response) -> str:
 
 
 def has_data_credential() -> bool:
-    """True when the environment holds something a request can be billed to:
-    an API key, or a wallet to pay per call with x402. The one place that
-    decides it, so the TUI gates and the client cannot disagree."""
-    return bool(os.environ.get(API_KEY_ENV) or os.environ.get(WALLET_KEY_ENV))
+    """True when a request can be billed without turning payments on by surprise.
+
+    An API key counts. A wallet key counts only when x402 has been explicitly
+    enabled on the network profile. The safe profile has neither.
+    """
+    if os.environ.get(API_KEY_ENV):
+        return True
+    return bool(os.environ.get(WALLET_KEY_ENV) and x402_payments_allowed())
 
 
 class FDClientError(Exception):
@@ -83,15 +94,33 @@ class FDClient:
         """An API key bills the account; otherwise a wallet key pays each
         call with x402. Both set means the key wins, which is the API's own
         rule: a request carrying X-API-KEY is never charged to a wallet."""
-        self._api_key = api_key or os.environ.get(API_KEY_ENV, "")
-        self._wallet_key = wallet_key or os.environ.get(WALLET_KEY_ENV, "")
+        self._api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV, "")
+        self._wallet_key = wallet_key if wallet_key is not None else os.environ.get(WALLET_KEY_ENV, "")
         self._timeout = timeout
+        self._request_count = 0
+        if not self._api_key and not self._wallet_key:
+            raise FDClientError(
+                f"no data credential. Set {API_KEY_ENV}, or set {WALLET_KEY_ENV} "
+                "only together with AIHF_PROFILE=network and AIHF_ENABLE_X402=1."
+            )
         if self.pays_per_call():
+            if not x402_payments_allowed():
+                raise FDClientError(
+                    "x402 payments are disabled. Refusing to send wallet-paid requests. "
+                    "Set AIHF_PROFILE=network and AIHF_ENABLE_X402=1 to opt in, "
+                    "or set an API key instead."
+                )
             try:
                 self._session = payment_session(self._wallet_key)
-            except ImportError as exc:
+            except (ImportError, RuntimeError) as exc:
                 raise FDClientError(str(exc)) from exc
         else:
+            if self._wallet_key and not self._api_key:
+                raise FDClientError(
+                    "x402 payments are disabled. Refusing to send the wallet key's "
+                    "requests. Set AIHF_PROFILE=network and AIHF_ENABLE_X402=1 to opt in, "
+                    "or set an API key instead."
+                )
             self._session = requests.Session()
             self._session.headers["X-API-Key"] = self._api_key
 
@@ -295,7 +324,14 @@ class FDClient:
         body = resp.json()
         rows = body.get(response_key)
         next_page_url = body.get("next_page_url")
+        pages = 1
         while next_page_url and isinstance(rows, list):
+            pages += 1
+            if pages > MAX_PAGES:
+                raise FDClientError(
+                    f"{path} exceeded the page budget of {MAX_PAGES}",
+                    path=path,
+                )
             resp = self._request("GET", next_page_url)
             if resp is None:
                 break
@@ -324,16 +360,30 @@ class FDClient:
         *path* may be an absolute URL (a ``next_page_url`` from a previous
         response), which is requested verbatim.
         """
-        url = path if path.startswith("http") else self.BASE_URL + path
+        url = self._validated_url(path)
         for attempt, delay in enumerate((*self._RETRY_DELAYS, None)):
+            self._request_count += 1
+            if self._request_count > MAX_REQUESTS:
+                raise FDClientError(
+                    f"request budget of {MAX_REQUESTS} exhausted",
+                    path=path,
+                )
             try:
                 resp = self._session.request(
-                    method, url, timeout=self._timeout, **kwargs,
+                    method, url, timeout=self._timeout, allow_redirects=False, **kwargs,
                 )
             except requests.RequestException as exc:
                 raise FDClientError(
-                    f"{method} {path} failed: {exc}", path=path,
+                    self._redact(f"{method} {path} failed: {exc}"), path=path,
                 ) from exc
+
+            if 300 <= resp.status_code < 400:
+                # Do not include Location or the body: either can be attacker
+                # content, and the body must not echo the API key into a log.
+                raise FDClientError(
+                    f"{method} refused redirect {resp.status_code}; redirects are not followed",
+                    status_code=resp.status_code, path=path,
+                )
 
             if resp.status_code in (429, 503) and delay is not None:
                 logger.info(
@@ -347,7 +397,7 @@ class FDClient:
                 return None
 
             if resp.status_code >= 400:
-                message = f"{method} {path} returned {resp.status_code}: {resp.text[:200]}"
+                message = self._redact(f"{method} {path} returned {resp.status_code}: {resp.text[:200]}")
                 if resp.status_code == 402 and self.pays_per_call():
                     message += f" (x402 payment from the wallet failed: {payment_error(resp)})"
                 if resp.status_code == 403 and self.pays_per_call():
@@ -363,3 +413,31 @@ class FDClient:
             f"{method} {path} returned {resp.status_code} after {len(self._RETRY_DELAYS)} retries",
             status_code=resp.status_code, path=path,
         )
+
+    def _redact(self, text: str) -> str:
+        for secret in (self._api_key, self._wallet_key):
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        return text
+
+    def _validated_url(self, path: str) -> str:
+        """Only HTTPS on the Financial Datasets host, default port, no userinfo.
+
+        The authority is checked before the request is built, so a pagination
+        URL or a redirect target cannot move the API key to another host.
+        """
+        if path.startswith("https://"):
+            url = path
+        elif path.startswith("/"):
+            url = self.BASE_URL + path
+        else:
+            raise FDClientError("refusing non-relative data URL")
+        parsed = urlsplit(url)
+        authority = parsed.netloc.lower()
+        if any(mark in authority for mark in ("\\", "%", "@", " ")):
+            raise FDClientError("refusing data URL with an encoded or credentialed authority")
+        if authority not in (ALLOWED_DATA_HOST, f"{ALLOWED_DATA_HOST}:443"):
+            raise FDClientError(f"refusing data URL outside https://{ALLOWED_DATA_HOST}")
+        if parsed.scheme != "https":
+            raise FDClientError("refusing non-HTTPS data URL")
+        return url

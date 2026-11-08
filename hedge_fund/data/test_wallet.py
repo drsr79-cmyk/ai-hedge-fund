@@ -12,7 +12,14 @@ from hedge_fund.data.wallet import payment_session, PaymentFailed
 PRIVATE_KEY = "0x" + "0" * 63 + "1"
 
 
+def test_payments_are_refused_without_an_explicit_opt_in():
+    with pytest.raises(RuntimeError, match="x402 payments are disabled"):
+        payment_session(PRIVATE_KEY)
+
+
 def test_missing_package_names_the_install_command(monkeypatch):
+    monkeypatch.setenv("AIHF_PROFILE", "network")
+    monkeypatch.setenv("AIHF_ENABLE_X402", "1")
     real_import = builtins.__import__
 
     def without_x402(name, *args, **kwargs):
@@ -32,7 +39,9 @@ def test_payment_failure_is_a_request_exception():
     assert issubclass(PaymentFailed, requests.RequestException)
 
 
-def test_session_pays_from_the_wallet_on_base():
+def test_session_pays_from_the_wallet_on_base(monkeypatch):
+    monkeypatch.setenv("AIHF_PROFILE", "network")
+    monkeypatch.setenv("AIHF_ENABLE_X402", "1")
     pytest.importorskip("x402")  # the optional extra
     from x402.http.clients.requests import x402HTTPAdapter
 

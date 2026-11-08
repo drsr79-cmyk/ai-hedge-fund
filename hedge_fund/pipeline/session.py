@@ -168,7 +168,24 @@ def advance(
     reconcile(state, broker, spec.name)
 
     executed: CycleRecord | None = None
-    if state.pending is not None:
+    # Mark before any order. A drawdown breach flattens now and does not
+    # send the pending decision. A fund that is already flat and still
+    # through the line is not asked for a new decision.
+    held_before = broker.positions()
+    pre = clock.marks([*held_before, spec.benchmark], session)
+    pre_marks = {t: pre.prices[t] for t in sorted(held_before)}
+    pre_positions = {t: p.shares for t, p in sorted(held_before.items())}
+    pre_nav = broker.cash() + sum(shares * pre_marks[t] for t, shares in pre_positions.items())
+    peak = state.peak_nav if state.peak_nav is not None else spec.capital
+    pre_drawdown = max(0.0, 1 - pre_nav / peak) if peak else 0.0
+    stopped = spec.risk.max_drawdown_pct is not None and pre_drawdown >= spec.risk.max_drawdown_pct
+    if stopped:
+        if pre_positions and state.last_session is not None:
+            stop = stop_out_decision(
+                spec, state.last_session, universe, pre_marks, pre_positions, pre_drawdown,
+            )
+            executed = execute_decision(fund, stop, session, broker, data_client, clock)
+    elif state.pending is not None:
         executed = execute_decision(fund, state.pending, session, broker, data_client, clock)
 
     held = broker.positions()
@@ -179,14 +196,9 @@ def advance(
     nav = cash + sum(shares * marks[t] for t, shares in positions.items())
 
     rebalance = is_rebalance_session(session, state.last_session, spec.rebalance)
-    # A state written before the peak was tracked measures from the capital.
-    peak = state.peak_nav if state.peak_nav is not None else spec.capital
-    drawdown = max(0.0, 1 - nav / peak)
-    if spec.risk.max_drawdown_pct is not None and drawdown >= spec.risk.max_drawdown_pct:
-        # Stopped out: sell everything at the next close, then sit in cash.
-        # A fund in cash never climbs back over the line, so no analyst is
-        # asked again until the operator raises the limit.
-        decision = stop_out_decision(spec, session, universe, marks, positions, drawdown) if positions else None
+    drawdown = max(0.0, 1 - nav / peak) if peak else 0.0
+    if stopped:
+        decision = None
     else:
         decision = assess_fund(fund, session, data_client, universe, clock, allocation, drawdown) if rebalance else None
 

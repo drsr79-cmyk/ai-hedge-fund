@@ -4,10 +4,10 @@ Secrets live in ``~/.hedge-fund/.env`` (see paths.py), loaded by
 ``python-dotenv`` at every entry point — this module writes to that same file
 rather than inventing a second store. Two rules follow from it:
 
-1. **The environment wins.** A key exported in your shell, or injected by CI,
-   is always what runs; ``load_dotenv()`` does not override an existing
-   variable. ``.env`` is a fallback for people who do not want to manage
-   exports, never an override.
+1. **Safe profile drops inherited secrets.** Network profile loads only
+   ``~/.hedge-fund/.env``, and only when ``AIHF_LOAD_DOTENV=1``. A key
+   already in the environment is kept in that case; a working-directory
+   ``.env`` is never read.
 2. **Edits are surgical.** Saving a key rewrites exactly the one line that
    defines it and leaves every other line — other keys, comments, blanks —
    byte-for-byte intact. A settings screen must never eat a file it did not
@@ -21,20 +21,22 @@ from __future__ import annotations
 import os
 import re
 import stat
-from pathlib import Path
-
-from dotenv import load_dotenv
 
 from hedge_fund.llm import PROVIDER_ENV_VARS, env_var_for  # noqa: F401  (re-export)
 from hedge_fund.paths import ENV_PATH
 
 
 def apply_credentials() -> None:
-    """Load .env files into the environment without overriding what is already
-    set. Call once at startup, before anything builds an agent. A ``.env`` in
-    the current directory (a checkout) wins over the user-level file."""
-    load_dotenv(Path.cwd() / ".env", override=False)
-    load_dotenv(ENV_PATH, override=False)
+    """Apply the process profile's credential rules.
+
+    Safe profile (the default) drops inherited provider secrets and does not
+    read dotenv files. Network profile loads ``~/.hedge-fund/.env`` only when
+    ``AIHF_LOAD_DOTENV=1``. A ``.env`` in the working directory is never read,
+    including when a paper runner is started with the fund directory as cwd.
+    """
+    from hedge_fund.safety.profile import apply_profile_credentials
+
+    apply_profile_credentials()
 
 
 def save_credential(env_var: str, value: str) -> Path:

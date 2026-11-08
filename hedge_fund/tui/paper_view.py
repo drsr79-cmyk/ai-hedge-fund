@@ -301,7 +301,9 @@ def fetch_snapshots(tickers: list[str]) -> dict[str, PriceSnapshot]:
     """One real-time quote per ticker, fetched together. Empty when there is
     no credential to ask with or the API refuses: the pane then shows the
     last close and nothing else, which is the honest fallback."""
-    if not tickers or not has_data_credential():
+    from hedge_fund.safety.profile import SAFE, current_profile
+
+    if current_profile() == SAFE or not tickers or not has_data_credential():
         return {}
     quotes: dict[str, PriceSnapshot] = {}
     try:

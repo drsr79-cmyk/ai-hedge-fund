@@ -275,6 +275,7 @@ def test_cli_jev_cycle_and_saved_replay(tmp_path, monkeypatch, http, capsys):
     monkeypatch.setattr(keys, "ENV_PATH", tmp_path / "saved.env")
     for variable in (*PROVIDER_ENV_VARS.values(), "MOONSHOT_API_KEY"):
         monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("AIHF_PROFILE", "network")
     monkeypatch.setenv("TYPESAFE_API_KEY", API_KEY)
     monkeypatch.setenv("HEDGE_FUND_LLM_MODEL", "claude-opus-5")
     monkeypatch.setattr(run, "ensure_mandates_dir", lambda: tmp_path)

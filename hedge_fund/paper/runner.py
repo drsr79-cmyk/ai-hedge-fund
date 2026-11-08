@@ -54,7 +54,8 @@ from hedge_fund.data.sessions import NEW_YORK
 from hedge_fund.fund import Fund, FundSpec
 from hedge_fund.paper.deployed import load_deployed
 from hedge_fund.paper.ledger import Ledger
-from hedge_fund.paper.tick import _run, next_session, print_day
+from hedge_fund.paper.tick import _require_approval, _run, next_session, print_day
+from hedge_fund.safety.approval import ApprovalRequired
 from hedge_fund.pipeline.clock import LiveClock
 from hedge_fund.pipeline.session import FundHalted, SessionRecord
 
@@ -74,6 +75,7 @@ def run(
     on_event: Callable[[str, dict], None] | None = None,
     now: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
+    approver: Callable[[str, str, object], str] | None = None,
 ) -> None:
     """Advance the fund in *directory* session by session until *stop* is set.
 
@@ -82,18 +84,25 @@ def run(
     FundHalted when the kill switch is set (on start, or after a session
     fails).
     """
+    from hedge_fund.safety.profile import SAFE, current_profile
+    from hedge_fund.safety.secrets import require_secretless_process
+
+    if current_profile() == SAFE:
+        require_secretless_process()
     directory = Path(directory)
     deployed = load_deployed(directory)
+    if approver is None:
+        raise ApprovalRequired(deployed.name, "unattended", "disabled")
     stop = stop or threading.Event()
     now = now or (lambda: datetime.now(NEW_YORK))
     sleep = sleep or stop.wait
     fund = (build_fund or Fund)(deployed.spec)  # once: the analysts' caches live across sessions
     loop = _run_bars if deployed.spec.is_intraday else _run_days
     loop(directory, deployed, data_client, fund, stop=stop, build_fund=build_fund,
-         on_record=on_record, on_event=on_event, now=now, sleep=sleep)
+         on_record=on_record, on_event=on_event, now=now, sleep=sleep, approver=approver)
 
 
-def _run_days(directory, deployed, data_client, fund, *, stop, build_fund, on_record, on_event, now, sleep):
+def _run_days(directory, deployed, data_client, fund, *, stop, build_fund, on_record, on_event, now, sleep, approver):
     """A daily fund: every session that has become due, oldest first, then
     sleep to the next turn of the day."""
     spec = deployed.spec
@@ -106,6 +115,7 @@ def _run_days(directory, deployed, data_client, fund, *, stop, build_fund, on_re
         if due is None:
             _wait_for(_next_look(now()), now, sleep)
             continue
+        _require_approval(deployed.name, due, state.pending, approver(deployed.name, due, state.pending))
         record = _run(directory, deployed, ledger, state, due, data_client, build_fund, fund=fund)
         if on_record is not None:
             on_record(record)
@@ -121,7 +131,7 @@ def _next_look(now: datetime) -> datetime:
     return min(turn + timedelta(days=1), local + timedelta(seconds=_DAY_POLL))
 
 
-def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_record, on_event, now, sleep):
+def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_record, on_event, now, sleep, approver):
     """A minute fund: one print per name at each boundary, the bar advanced
     there, gaps logged for the boundaries the loop was not awake for."""
     spec = deployed.spec
@@ -172,6 +182,7 @@ def _run_bars(directory, deployed, data_client, fund, *, stop, build_fund, on_re
                 event("gap", **{"from": state.last_session, "to": bar,
                                 "bars_skipped": bars_between(state.last_session, bar, spec.interval_seconds, spec.window)})
 
+        _require_approval(deployed.name, bar, state.pending, approver(deployed.name, bar, state.pending))
         record = _run(directory, deployed, ledger, state, bar, data_client, build_fund, clock=clock, fund=fund)
         if on_record is not None:
             on_record(record)
@@ -196,17 +207,25 @@ def serve(
     build_fund: Callable[[FundSpec], Fund] | None = None,
     on_record: Callable[[SessionRecord], None] | None = None,
     on_event: Callable[[str, dict], None] | None = None,
+    approver: Callable[[str, str, object], str] | None = None,
 ) -> None:
     """`run` as a process: one per fund, found by its pid file, stopped by
-    SIGTERM or SIGINT after the bar in flight. Refuses to start twice."""
+    SIGTERM or SIGINT after the bar in flight. Refuses to start twice.
+
+    Without *approver* this refuses before writing a pid file. The CLI does
+    not pass one: unattended paper runs are disabled.
+    """
     directory = Path(directory)
     if is_running(directory):
         raise RuntimeError(f"{directory.name} is already running (pid {_read_pid(directory)})")
+    if approver is None:
+        raise ApprovalRequired(directory.name, "unattended", "disabled")
     stop = threading.Event()
     previous = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
     (directory / PID_FILE).write_text(str(os.getpid()))
     try:
-        run(directory, data_client, stop=stop, build_fund=build_fund, on_record=on_record, on_event=on_event)
+        run(directory, data_client, stop=stop, build_fund=build_fund, on_record=on_record,
+            on_event=on_event, approver=approver)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)

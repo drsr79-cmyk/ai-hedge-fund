@@ -218,9 +218,13 @@ class Ledger:
     # ---- the kill switch --------------------------------------------------
 
     def halted(self) -> str | None:
-        """The halt reason, or None when the fund may trade."""
+        """The halt reason, or None when the fund may trade.
+
+        A missing switch file is halted. Deleting ``control.json`` is not a
+        way to resume.
+        """
         if not self.control_path.exists():
-            return None
+            return "kill switch file is missing"
         try:
             control = json.loads(self.control_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:

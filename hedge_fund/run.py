@@ -74,13 +74,21 @@ from hedge_fund.paper import (
     load_deployed,
     NothingDue,
     redo,
-    serve,
     stop_runner,
     tick,
     validate_fund_name,
 )
 from hedge_fund.paths import ensure_mandates_dir, PAPER_DIR
 from hedge_fund.pipeline import FundHalted, SessionRecord
+from hedge_fund.safety.approval import ApprovalRequired
+from hedge_fund.safety.offline import (
+    FIXTURE_UNIVERSE,
+    fixture_spec,
+    frozen_now,
+    is_fixture_mandate,
+    synthetic_client,
+)
+from hedge_fund.safety.profile import SAFE, current_profile
 from hedge_fund.scorecard import score
 from hedge_fund.tui.keys import apply_credentials
 from hedge_fund.tui.report import cost_line
@@ -111,6 +119,9 @@ def main() -> None:
             _backtest(args, parser, console)
         else:
             _paper(args, parser, console)
+    except ApprovalRequired as exc:
+        console.print(f"[yellow]{exc}[/]")
+        sys.exit(2)
     except (FundHalted, NothingDue, LedgerError) as exc:
         console.print(f"[red]{exc}[/]")
         sys.exit(1)
@@ -161,8 +172,19 @@ def _parser() -> argparse.ArgumentParser:
                                            "must be the next unrecorded one")
     advance.add_argument("--again", action="store_true",
                          help="run the latest recorded session again and replace its record")
+    advance.add_argument("--approve", metavar="TOKEN",
+                         help="approval token for this session; without it the tick refuses and prints the token")
 
-    runner = actions.add_parser("run", help="stay up and advance the fund whenever a session is due")
+    offline = actions.add_parser(
+        "offline",
+        help="deploy the labelled synthetic fixture (no network, no credentials)",
+    )
+    offline.add_argument("name", help="fund name; becomes ~/.hedge-fund/paper/<name>/")
+
+    runner = actions.add_parser(
+        "run",
+        help="refused: unattended paper runs are disabled; approve one session with tick --approve",
+    )
     runner.add_argument("name")
 
     stopper = actions.add_parser("stop", help="stop a fund's runner after the session in flight")
@@ -273,8 +295,29 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
             f"[bold]{args.name}[/] deployed at {directory}  ·  mandate {spec.name}  ·  "
             f"{', '.join(universe)}  ·  ${spec.capital:,.0f}  ·  {cadence}"
         )
-        console.print(f"[dim]next: `aihf paper tick {args.name}` to run one session, `aihf paper run "
-                      f"{args.name}` to leave it running, `aihf paper status {args.name}` any time[/]")
+        console.print(f"[dim]next: `aihf paper tick {args.name}` prints an approval token and does not "
+                      f"trade; pass `--approve TOKEN` to record that one session. "
+                      f"Unattended `paper run` is disabled.[/]")
+        return
+
+    if args.action == "offline":
+        try:
+            validate_fund_name(args.name)
+        except ValueError as exc:
+            parser.error(str(exc))
+        spec = fixture_spec()
+        try:
+            directory = deploy(args.name, spec, list(FIXTURE_UNIVERSE), root=PAPER_DIR)
+        except FileExistsError as exc:
+            parser.error(str(exc))
+        console.print(
+            f"[bold]{args.name}[/] offline fixture at {directory}  ·  "
+            f"{', '.join(FIXTURE_UNIVERSE)}  ·  synthetic prices through the frozen clock "
+            f"{frozen_now().date().isoformat()}  ·  not a forecast and not profitability evidence"
+        )
+        console.print("[dim]engineering risk defaults: long-only, gross ≤ 1, 10% name cap, "
+                      "10% drawdown stop, 5% ADV cap. These are not an investment policy.[/]")
+        console.print(f"[dim]next: `aihf paper tick {args.name}` to see the approval token[/]")
         return
 
     if args.action == "list":
@@ -286,39 +329,43 @@ def _paper(args, parser: argparse.ArgumentParser, console: Console) -> None:
 
     if args.action == "tick":
         deployed = load_deployed(directory)
-        with FDClient() as raw:
+        profile = current_profile()
+        raw = None
+        if profile == SAFE:
+            if not is_fixture_mandate(deployed.spec):
+                parser.error(
+                    f"{deployed.name} is not the labelled offline fixture. "
+                    "The safe profile (default) will not call a data vendor or a model. "
+                    "Deploy one with `aihf paper offline <name>`, or set AIHF_PROFILE=network "
+                    "to opt into networked paper explicitly."
+                )
+            fd = synthetic_client(deployed.universe, deployed.spec.benchmark)
+            now = frozen_now
+        else:
+            raw = FDClient()
             fd = CachedDataClient(raw, live=deployed.spec.is_intraday)
+            now = None
+        try:
             verb = "running the latest session again" if args.again else "advancing one session"
             with console.status(
                 f"[cyan]{deployed.name}: {verb} over {', '.join(deployed.universe)}…", spinner="dots",
             ):
-                record = (redo(directory, fd, build_fund=None) if args.again
-                          else tick(directory, fd, session=args.session))
+                record = (redo(directory, fd, build_fund=None, approval=args.approve) if args.again
+                          else tick(directory, fd, session=args.session, approval=args.approve, now=now))
+        finally:
+            if raw is not None:
+                raw.close()
         print(record.model_dump_json(indent=2))
         console.print(_tick_summary(deployed.name, record))
+        if profile == SAFE:
+            console.print("[dim]synthetic fixture session. Not a forecast and not profitability evidence.[/]")
         return
 
     if args.action == "run":
-        deployed = load_deployed(directory)
-        spec = deployed.spec
-        cadence = f"{spec.cadence_label}, {spec.window.label}" if spec.is_intraday else spec.rebalance
-        console.print(f"[bold]{deployed.name}[/] running {cadence}  ·  "
-                      f"{', '.join(deployed.universe)}  ·  Ctrl-C or `aihf paper stop {deployed.name}` to stop")
-
-        def _event(kind: str, fields: dict) -> None:
-            detail = fields.get("reason") or (f"{fields.get('bars_skipped')} bars skipped" if "bars_skipped" in fields else "")
-            console.print(f"[yellow]{kind}[/] {fields.get('from') or 'start'} → {fields.get('to')}  {detail}".rstrip())
-
-        with FDClient() as raw:
-            try:
-                serve(directory, CachedDataClient(raw, live=spec.is_intraday),
-                      on_record=lambda record: console.print(_tick_summary(deployed.name, record)),
-                      on_event=_event)
-            except RuntimeError as exc:  # already running
-                console.print(f"[red]{exc}[/]")
-                sys.exit(1)
-        console.print(f"[dim]{deployed.name} stopped[/]")
-        return
+        parser.error(
+            "unattended paper run is disabled. Approve one session at a time: "
+            "`aihf paper tick <name>` prints a token; `--approve TOKEN` records that session only."
+        )
 
     if args.action == "stop":
         if stop_runner(directory):

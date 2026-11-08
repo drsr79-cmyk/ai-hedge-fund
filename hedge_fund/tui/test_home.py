@@ -64,7 +64,7 @@ def test_data_credential_gate_takes_a_key_or_a_wallet(monkeypatch, isolated_conf
     async def scenario():
         app = HedgeFundApp()
         resumed = Mock()
-        async with app.run_test(size=(100, 40)) as pilot:
+        async with app.run_test(size=(120, 60)) as pilot:
             assert home.demand_run_keys(app, resumed) is False
             await pilot.pause()
             assert isinstance(app.screen, home.DataKeyPromptScreen)
@@ -81,7 +81,13 @@ def test_data_credential_gate_takes_a_key_or_a_wallet(monkeypatch, isolated_conf
             assert os.environ[env_var] == "fixture-secret-value"
             assert isolated_configuration.read_text() == f"{env_var}=fixture-secret-value\n"
             assert stat.S_IMODE(isolated_configuration.stat().st_mode) == 0o600
-            assert home.demand_run_keys(app, resumed) is True
+            # An API key satisfies the gate. A saved wallet key does not: payments
+            # stay disabled unless the network profile and AIHF_ENABLE_X402=1 are set.
+            if env_var == "FINANCIAL_DATASETS_API_KEY":
+                assert home.demand_run_keys(app, resumed) is True
+            else:
+                from hedge_fund.data.client import has_data_credential
+                assert has_data_credential() is False
 
     asyncio.run(scenario())
 
@@ -110,22 +116,29 @@ def test_missing_key_gate_save_resumes_and_cancel_does_not(monkeypatch, isolated
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    "exported,local,expected",
-    [
-        ("shell-key", "local-key", "shell-key"),
-        (None, "local-key", "local-key"),
-        (None, None, "saved-key"),
-    ],
-)
-def test_credential_precedence(exported, local, expected, isolated_configuration, tmp_path, monkeypatch):
+def test_safe_profile_drops_inherited_keys_and_ignores_dotenv_files(
+    isolated_configuration, tmp_path, monkeypatch,
+):
+    """The default profile does not keep a shell key or read any .env file."""
     isolated_configuration.write_text("TYPESAFE_API_KEY=saved-key\n")
-    if local:
-        (tmp_path / ".env").write_text(f"TYPESAFE_API_KEY={local}\n")
-    if exported:
-        monkeypatch.setenv("TYPESAFE_API_KEY", exported)
+    (tmp_path / ".env").write_text("TYPESAFE_API_KEY=cwd-key\nOPENAI_API_BASE=https://cwd.invalid/v1\n")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "shell-key")
+    monkeypatch.delenv("AIHF_PROFILE", raising=False)
     keys.apply_credentials()
-    assert os.environ["TYPESAFE_API_KEY"] == expected
+    assert "TYPESAFE_API_KEY" not in os.environ
+    assert "OPENAI_API_BASE" not in os.environ
+
+
+def test_network_profile_never_reads_the_working_directory_dotenv(
+    isolated_configuration, tmp_path, monkeypatch,
+):
+    isolated_configuration.write_text("TYPESAFE_API_KEY=saved-key\n")
+    (tmp_path / ".env").write_text("TYPESAFE_API_KEY=cwd-key\nOPENAI_API_BASE=https://cwd.invalid/v1\n")
+    monkeypatch.setenv("AIHF_PROFILE", "network")
+    monkeypatch.setenv("AIHF_LOAD_DOTENV", "1")
+    keys.apply_credentials()
+    assert os.environ["TYPESAFE_API_KEY"] == "saved-key"
+    assert "OPENAI_API_BASE" not in os.environ
 
 
 def test_home_offers_paper_trading_first_and_an_empty_paper_screen_builds():

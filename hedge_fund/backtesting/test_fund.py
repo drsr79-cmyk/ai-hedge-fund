@@ -187,9 +187,11 @@ def test_a_stopped_out_backtest_keeps_marking_to_the_end():
     }
     result = _run(series, _spec(risk={"max_position_pct": 1.0, "max_gross_exposure": 1.0, "max_drawdown_pct": 0.20}))
     assert len(result.records) == len(WEEKDAYS)
-    assert result.records[2].decision.is_stopped_out
-    assert result.cycles[1].positions == {}                       # Thursday's sale
-    assert result.nav[3:] == [pytest.approx(75_000.0)] * 12       # flat in cash to the end
+    assert result.records[2].decision is None
+    assert result.records[2].executed.refreshed_assessment.is_stopped_out
+    assert result.records[2].positions == {}
+    assert result.cycles[1].positions == {}                       # flattened the day the breach is marked
+    assert result.nav[2:] == [pytest.approx(75_000.0)] * (len(WEEKDAYS) - 2)
     assert all(r.decision is None for r in result.records[3:])
     assert result.metrics.n_cycles == 2 and result.metrics.max_drawdown_pct == pytest.approx(0.25)
 

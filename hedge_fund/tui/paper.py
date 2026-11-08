@@ -21,6 +21,8 @@ from hedge_fund.data import CachedDataClient, FDClient, PriceSnapshot
 from hedge_fund.data.bars import is_intraday
 from hedge_fund.fund import FundSpec
 from hedge_fund.llm import make_llm
+from contextlib import nullcontext
+
 from hedge_fund.paper import (
     assessment_dates,
     DeployedFund,
@@ -31,10 +33,12 @@ from hedge_fund.paper import (
     next_session,
     NothingDue,
     redo,
-    spawn_runner,
     stop_runner,
     tick,
 )
+from hedge_fund.safety.approval import approval_token, pending_fingerprint
+from hedge_fund.safety.offline import frozen_now, is_fixture_mandate, synthetic_client
+from hedge_fund.safety.profile import SAFE, current_profile
 from hedge_fund.pipeline import (
     DecisionRecord,
     FundState,
@@ -292,20 +296,10 @@ class PaperScreen(Screen):
             self.notify(f"{name} stopping after the session in flight")
             self._populate(name)
             return
-        if snap.halted:
-            self.notify(f"{name} is halted — r to resume first.", severity="warning")
-            return
-
-        def resume() -> None:
-            if demand_run_keys(self.app, resume):
-                try:
-                    spawn_runner(snap.directory)
-                except OSError as exc:
-                    self.notify(f"Could not start {name}: {exc}", severity="error")
-                    return
-                self.notify(f"{name} running · {cadence_identity(snap.spec)}")
-                self._populate(name)
-        resume()
+        self.notify(
+            "Unattended paper runs are disabled. Press enter to approve one session.",
+            severity="warning",
+        )
 
     def _after_confirm(self, directory: Path, verdict: str | None) -> None:
         if verdict is not None:
@@ -494,8 +488,18 @@ class RunSessionScreen(Screen):
             spec = deployed.spec
             ledger = Ledger(directory)
             state = ledger.replay(spec.capital)
-            with FDClient() as raw:
-                data = CachedDataClient(raw, live=spec.is_intraday)
+            profile = current_profile()
+            if profile == SAFE and not is_fixture_mandate(spec):
+                raise RuntimeError(
+                    f"{deployed.name} is not the offline fixture. The safe profile does not "
+                    "open a data or model connection. Deploy with `aihf paper offline`."
+                )
+            client = (
+                nullcontext(synthetic_client(deployed.universe, spec.benchmark))
+                if profile == SAFE else FDClient()
+            )
+            with client as raw:
+                data = raw if profile == SAFE else CachedDataClient(raw, live=spec.is_intraday)
                 if self._redo:
                     if state.last_session is None:
                         raise NothingDue("no session recorded yet, nothing to run again")
@@ -511,7 +515,11 @@ class RunSessionScreen(Screen):
                 app.call_from_thread(self._begin_board, deployed, due, dates, state.pending)
                 if dates:
                     self._warm(spec, deployed.universe, dates)
-                record = redo(directory, data) if self._redo else tick(directory, data)
+                token = approval_token(deployed.name, due, pending_fingerprint(state.pending))
+                record = (
+                    redo(directory, data, approval=token) if self._redo
+                    else tick(directory, data, approval=token, now=frozen_now if profile == SAFE else None)
+                )
             app.call_from_thread(self._show_report, deployed, record)
         except Exception as exc:  # fail loud, in the UI
             app.call_from_thread(self._fail, exc)

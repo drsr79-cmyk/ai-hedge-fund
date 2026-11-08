@@ -29,5 +29,8 @@ def isolated_configuration(tmp_path, monkeypatch):
         # directly rather than through monkeypatch.
         monkeypatch.setenv(variable, "")
         monkeypatch.delenv(variable, raising=False)
+    # These screens are the credential UI. Network profile keeps keys the test
+    # sets; the safe profile's rejection of inherited secrets is tested apart.
+    monkeypatch.setenv("AIHF_PROFILE", "network")
     monkeypatch.setattr(requests.sessions.Session, "request", Mock(side_effect=AssertionError("No live HTTP in TUI tests")))
     return saved

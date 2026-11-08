@@ -138,7 +138,13 @@ def no_env_credentials(monkeypatch):
     monkeypatch.delenv("X402_WALLET_PRIVATE_KEY", raising=False)
 
 
+def _allow_x402(monkeypatch):
+    monkeypatch.setenv("AIHF_PROFILE", "network")
+    monkeypatch.setenv("AIHF_ENABLE_X402", "1")
+
+
 def test_wallet_alone_pays_per_call_and_sends_no_key(monkeypatch, no_env_credentials):
+    _allow_x402(monkeypatch)
     monkeypatch.setattr(client_module, "payment_session", _plain_session)
     with FDClient(api_key="", wallet_key="0xabc") as c:
         assert c.pays_per_call()
@@ -158,9 +164,13 @@ def test_api_key_wins_over_a_wallet(monkeypatch, no_env_credentials):
 def test_credentials_come_from_the_environment(monkeypatch, no_env_credentials):
     monkeypatch.setattr(client_module, "payment_session", _plain_session)
     assert not has_data_credential()
-    with FDClient() as c:
-        assert not c.pays_per_call() and c._session.headers["X-API-Key"] == ""
+    with pytest.raises(FDClientError, match="no data credential"):
+        FDClient()
     monkeypatch.setenv("X402_WALLET_PRIVATE_KEY", "0xenv")
+    assert not has_data_credential()
+    with pytest.raises(FDClientError, match="x402 payments are disabled"):
+        FDClient()
+    _allow_x402(monkeypatch)
     assert has_data_credential()
     with FDClient() as c:
         assert c.pays_per_call() and c._session.wallet == "0xenv"
@@ -171,6 +181,7 @@ def test_credentials_come_from_the_environment(monkeypatch, no_env_credentials):
 
 
 def test_missing_x402_package_fails_with_the_install_command(monkeypatch, no_env_credentials):
+    _allow_x402(monkeypatch)
     def no_package(private_key):
         raise ImportError("X402_WALLET_PRIVATE_KEY is set but the x402 package is not installed: pip install 'aihf[x402]'")
     monkeypatch.setattr(client_module, "payment_session", no_package)
@@ -179,6 +190,7 @@ def test_missing_x402_package_fails_with_the_install_command(monkeypatch, no_env
 
 
 def test_payment_failure_fails_loud(monkeypatch, no_env_credentials):
+    _allow_x402(monkeypatch)
     monkeypatch.setattr(client_module, "payment_session", _plain_session)
     with FDClient(api_key="", wallet_key="0xabc") as c:
         _stub(c, [PaymentFailed("insufficient USDC")])
@@ -190,6 +202,7 @@ def test_402_on_a_wallet_names_the_reason_from_the_payment_header(monkeypatch, n
     """After the adapter pays, a 402 means the payment was refused. The body
     says only "Payment required"; the reason is in the PAYMENT-REQUIRED
     header, so the error names it."""
+    _allow_x402(monkeypatch)
     monkeypatch.setattr(client_module, "payment_session", _plain_session)
     terms = base64.b64encode(json.dumps({"x402Version": 2, "error": "payer_blocked", "accepts": []}).encode()).decode()
     with FDClient(api_key="", wallet_key="0xabc") as c:
@@ -207,6 +220,7 @@ def test_403_on_a_wallet_explains_the_history_window(monkeypatch, no_env_credent
     """x402 serves the last 365 days; the API's 403 names the window start,
     and the client adds what to do about it. A keyed client gets a 403 for
     other reasons, so it gets no such hint."""
+    _allow_x402(monkeypatch)
     monkeypatch.setattr(client_module, "payment_session", _plain_session)
     with FDClient(api_key="", wallet_key="0xabc") as c:
         _stub(c, [_FakeResponse(403, text="window starts 2025-01-01")])

@@ -1,0 +1,11 @@
+# Offline paper fixture. Long-only by construction.
+# The analyst is hedge_fund.signals.fixture.FixtureModel.
+# This file does not describe a real strategy and is not an investment policy.
+name: offline-fixture
+display_name: Offline fixture (not a forecast)
+models:
+  - name: fixture
+blend:
+  mode: long_only
+  method: conviction_weighted
+  gross_target: 1.0

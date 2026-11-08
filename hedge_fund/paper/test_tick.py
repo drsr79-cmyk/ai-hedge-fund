@@ -27,6 +27,7 @@ from hedge_fund.paper import (
 )
 from hedge_fund.pipeline import DecisionRecord, FundState
 from hedge_fund.pipeline.session import FundHalted
+from hedge_fund.safety.approval import approval_token, pending_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -60,8 +61,32 @@ def build_fund(spec):
     return Fund(spec, models={"solo": [FakeAnalyst("a", {"AAPL": 1})]})
 
 
+def _approval(directory, data, session=None):
+    deployed = load_deployed(directory)
+    ledger = Ledger(directory)
+    state = ledger.replay(deployed.spec.capital)
+    if session is not None and session in ledger.sessions():
+        return None
+    due = next_session(data, deployed.spec, state.last_session) if session is None else session
+    if due is None:
+        return None
+    return approval_token(deployed.name, due, pending_fingerprint(state.pending))
+
+
+def _redo_approval(directory):
+    deployed = load_deployed(directory)
+    ledger = Ledger(directory)
+    state = ledger.replay(deployed.spec.capital)
+    before = ledger.replay(deployed.spec.capital, before=state.last_session)
+    return approval_token(deployed.name, state.last_session, pending_fingerprint(before.pending))
+
+
 def _tick(directory, session=None, data=None):
-    return tick(directory, data or FakeDataClient(SERIES), session=session, build_fund=build_fund)
+    data = data or FakeDataClient(SERIES)
+    return tick(
+        directory, data, session=session, build_fund=build_fund,
+        approval=_approval(directory, data, session),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +219,7 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
     directory = deploy("alpha", spec, ["AAPL"], root=tmp_path)
     ledger = Ledger(directory)
     with pytest.raises(NothingDue, match="nothing to run again"):
-        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund, approval=_redo_approval(directory))
     _tick(directory)                         # 06-03: decided, long AAPL
     clock("2024-06-05")
     tuesday = _tick(directory)               # 06-04: bought 500 AAPL, decided again
@@ -204,7 +229,7 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
     # Same analysts, same close: the redo reproduces the session exactly. The
     # point is the book — without the restore, the broker would still hold
     # Tuesday's 500 shares going in and the reconciliation would halt the fund.
-    same = redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+    same = redo(directory, FakeDataClient(SERIES), build_fund=build_fund, approval=_redo_approval(directory))
     assert same == tuesday
     assert json.loads((directory / "broker.json").read_text()) == book_before
     kept = sorted((directory / "ledger" / "superseded").glob("*.json"))
@@ -213,7 +238,7 @@ def test_redo_runs_the_latest_session_again_and_replaces_its_record(tmp_path, cl
 
     # The analysts changed their minds by the evening: the 06-03 decision is
     # still what gets executed, but the new decision is different.
-    bearish = redo(directory, FakeDataClient(SERIES),
+    bearish = redo(directory, FakeDataClient(SERIES), approval=_redo_approval(directory),
                    build_fund=lambda s: Fund(s, models={"solo": [FakeAnalyst("a", {"AAPL": -1})]}))
     assert bearish.session == "2024-06-04" and bearish.prev_hash == tuesday.prev_hash
     assert bearish.positions == {"AAPL": 500}                    # executed the same pending decision
@@ -236,7 +261,7 @@ def test_redo_refuses_a_halted_fund_and_leaves_it_untouched(tmp_path, clock, SPE
     first = _tick(directory)
     Ledger(directory).halt("looking into it")
     with pytest.raises(FundHalted):
-        redo(directory, FakeDataClient(SERIES), build_fund=build_fund)
+        redo(directory, FakeDataClient(SERIES), build_fund=build_fund, approval=_redo_approval(directory))
     assert Ledger(directory).latest() == first
     assert not (directory / "ledger" / "superseded").exists()
 
